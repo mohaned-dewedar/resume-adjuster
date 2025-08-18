@@ -4,15 +4,13 @@ Refactored Resume MCP Server using modular components.
 import sys
 import logging
 import json
-import requests
-import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 from mcp.server.fastmcp import FastMCP
 
 # Import our modules
-from .models import CompilationResult, ConversionResult, UserInfo, SearchResult
+from .models import CompilationResult, ConversionResult, UserInfo
 from .notifications import send_system_notification
 from .latex import compile_pdf, get_latex_status
 from .conversions import convert_markdown_to_word, get_conversion_capabilities
@@ -42,50 +40,6 @@ STATE: Dict[str, Any] = {
     "cover_letter_request": None,
 }
 
-# -----------------------------
-# Company Research
-# -----------------------------
-def search_company_info(company_name: str) -> SearchResult:
-    """Search for company information using web APIs."""
-    try:
-        encoded_name = urllib.parse.quote(company_name)
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        # Try DuckDuckGo instant answers first
-        ddg_url = f"https://api.duckduckgo.com/?q={company_name}&format=json&no_html=1&skip_disambig=1"
-        response = requests.get(ddg_url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            abstract = data.get('Abstract', '')
-            if abstract:
-                return SearchResult(
-                    success=True,
-                    company_info=f"Company Overview: {abstract}",
-                    sources=[data.get('AbstractURL', 'DuckDuckGo')],
-                    error_message=None
-                )
-        
-        # Fallback: construct basic company info prompt
-        basic_info = f"Company: {company_name}\nNote: Web search unavailable. Please manually research this company's business model, products/services, company culture, recent news, and key values to better tailor the resume."
-        
-        return SearchResult(
-            success=True,
-            company_info=basic_info,
-            sources=[],
-            error_message="Limited information available - manual research recommended"
-        )
-        
-    except Exception as e:
-        log.warning(f"Company search failed for {company_name}: {e}")
-        return SearchResult(
-            success=False,
-            company_info=None,
-            sources=[],
-            error_message=f"Search error: {str(e)}"
-        )
 
 # -----------------------------
 # MCP Server
@@ -136,22 +90,6 @@ def get_complete_prompt():
         STATE.get("company_brief")
     )
 
-@mcp.resource("search://capabilities")
-def get_search_capabilities():
-    """Get information about available search functionality."""
-    return """Web Search Capabilities:
-
-Available Sources:
-- DuckDuckGo Instant Answers API for company overviews
-- Structured fallback prompts when APIs are unavailable
-
-Usage:
-- Call search_company_info(company_name) to automatically research companies
-- Results are cached in company_brief for resume tailoring
-- Manual research prompts provided when automated search fails
-
-The search functionality enhances resume tailoring by providing company context, 
-business model information, and cultural insights for better job application customization."""
 
 # -----------------------------
 # MCP Tools (Actions)
@@ -178,35 +116,6 @@ def load_job_posting(description: str, company_name: str = "") -> dict[str, str]
         "message": f"Job description loaded{f' for {company_name}' if company_name else ''}"
     }
 
-@mcp.tool()
-def load_job_posting_with_research(description: str, company_name: str, auto_research: bool = True) -> dict[str, str]:
-    """Load job posting and automatically research the company."""
-    STATE["job_description"] = description.strip()
-    STATE["company"] = company_name.strip()
-    
-    # Save job description
-    save_text("job_description.txt", description.strip())
-    
-    if auto_research and company_name:
-        result = search_company_info(company_name)
-        if result.success and result.company_info:
-            STATE["company_brief"] = result.company_info
-            # Save company brief
-            from .storage import sanitize_filename
-            filename = f"company_brief_{sanitize_filename(company_name)}.txt"
-            save_text(filename, result.company_info)
-            
-            return {
-                "status": "loaded_with_research",
-                "message": f"Job description and company research loaded for {company_name}",
-                "company_info": result.company_info[:200] + "..." if len(result.company_info) > 200 else result.company_info,
-                "sources": result.sources
-            }
-    
-    return {
-        "status": "loaded",
-        "message": f"Job description loaded for {company_name}. Use search_company_info() for research."
-    }
 
 @mcp.tool()
 def add_company_research(brief: str) -> dict[str, str]:
@@ -223,27 +132,6 @@ def add_company_research(brief: str) -> dict[str, str]:
     
     return {"status": "added", "message": "Company research brief added"}
 
-@mcp.tool()
-def search_company_info_tool(company_name: str) -> dict[str, Any]:
-    """Search web for company information and add to brief."""
-    result = search_company_info(company_name)
-    
-    if result.success and result.company_info:
-        STATE["company_brief"] = result.company_info
-        STATE["company"] = company_name  # Update company name
-        
-        # Save company brief
-        from .storage import sanitize_filename
-        filename = f"company_brief_{sanitize_filename(company_name)}.txt"
-        save_text(filename, result.company_info)
-        
-    return {
-        "success": result.success,
-        "company_info": result.company_info,
-        "sources": result.sources,
-        "error_message": result.error_message,
-        "message": "Company information added to brief" if result.success else "Search failed"
-    }
 
 @mcp.tool()
 def load_user_info(full_name: str, email: str, phone: str = "", address: str = "", 
@@ -284,7 +172,7 @@ def get_workflow_status() -> dict[str, Any]:
     if not status["job_loaded"]:
         next_steps.append("Load job posting with load_job_posting()")
     if status["job_loaded"] and not status["company_researched"]:
-        next_steps.append("Research company with search_company_info() or add_company_research()")
+        next_steps.append("Research company using web search, then call add_company_research()")
     if not status["user_info_loaded"]:
         next_steps.append("Load user info with load_user_info() for cover letters")
     if status["ready_for_generation"]:

@@ -14,7 +14,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "Your role includes: (1) Tailoring LaTeX resumes to align with job descriptions and company context, "
     "and (2) Creating compelling cover letters when requested. "
     "Focus on ATS compatibility, keyword optimization, and professional presentation. "
-    "Always use structured LaTeX output that compiles cleanly."
+    "Always use structured LaTeX output that compiles cleanly.\n\n"
+    "IMPORTANT: When you receive a job posting, use web search to research the company before tailoring the resume if you are not familiar with it. "
+    "Look for information about their business model, products/services, company culture, recent news, and key values. "
+    "Then call add_company_research() with your findings before proceeding with resume tailoring."
 )
 
 DEFAULT_USER_TEMPLATE = """Please tailor this resume for the job posting below, incorporating relevant company context.
