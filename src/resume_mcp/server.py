@@ -137,16 +137,34 @@ class CompilationProgress(BaseModel):
 class ProgressCallback:
     """Progress tracking callback for LaTeX compilation."""
     
-    def __init__(self, callback_fn: Optional[Callable[[CompilationProgress], None]] = None):
+    def __init__(self, callback_fn: Optional[Callable[[CompilationProgress], None]] = None, 
+                 use_terminal: bool = True, terminal_title: str = "LaTeX Compilation Progress"):
         self.callback_fn = callback_fn or self._default_progress_log
         self.start_time = time.time()
         self.current_stage = "initializing"
+        self.progress_terminal = None
+        
+        # Start progress terminal if requested
+        if use_terminal:
+            self.progress_terminal = ProgressTerminal(terminal_title)
+            self.progress_terminal._start_time = self.start_time
+            if not self.progress_terminal.start():
+                self.progress_terminal = None
         
     def _default_progress_log(self, progress: CompilationProgress):
-        """Default progress logging to stderr."""
+        """Default progress logging to stderr and terminal."""
         elapsed = time.time() - self.start_time
         eta_msg = f" (ETA: {progress.eta_seconds:.1f}s)" if progress.eta_seconds else ""
-        log.info(f"[{elapsed:.1f}s] {progress.stage}: {progress.progress:.1f}% - {progress.message}{eta_msg}")
+        log_msg = f"[{elapsed:.1f}s] {progress.stage}: {progress.progress:.1f}% - {progress.message}{eta_msg}"
+        
+        # Log to stderr
+        log.info(log_msg)
+        
+        # Also send to progress terminal if available
+        if self.progress_terminal:
+            self.progress_terminal.update_progress(
+                progress.stage, progress.progress, progress.message, progress.eta_seconds
+            )
     
     def update(self, stage: str, progress: float, message: str, eta_seconds: Optional[float] = None):
         """Update compilation progress."""
@@ -166,6 +184,12 @@ class ProgressCallback:
     def complete_stage(self, stage: str, message: str = ""):
         """Mark a stage as 100% complete."""
         self.update(stage, 100.0, message or f"Completed {stage}")
+    
+    def close_terminal(self):
+        """Close the progress terminal if it exists."""
+        if self.progress_terminal:
+            self.progress_terminal.close()
+            self.progress_terminal = None
 
 # -----------------------------
 # Prompt defaults
@@ -250,6 +274,253 @@ def _slugify(s: str) -> str:
     s = s.lower()
     s = re.sub(r"[^a-z0-9]+", "_", s)
     return s.strip("_")
+# -----------------------------
+# Progress Terminal Management
+# -----------------------------
+class ProgressTerminal:
+    """Manages a separate terminal window for displaying compilation progress."""
+    
+    def __init__(self, title: str = "LaTeX Compilation Progress"):
+        self.title = title
+        self.terminal_process = None
+        self.temp_script = None
+        self.progress_file = None
+        self.is_active = False
+        
+    def start(self) -> bool:
+        """Start a new terminal window for progress display."""
+        try:
+            import platform
+            system = platform.system().lower()
+            
+            # Create a temporary file for progress updates
+            self.progress_file = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.txt', delete=False
+            )
+            self.progress_file.write(f"{self.title}\n")
+            self.progress_file.write("=" * 50 + "\n")
+            self.progress_file.write("Initializing LaTeX compilation...\n")
+            self.progress_file.flush()
+            progress_file_path = self.progress_file.name
+            
+            # Create a script that monitors the progress file
+            self.temp_script = tempfile.NamedTemporaryFile(
+                mode='w', 
+                suffix='.bat' if system == 'windows' else '.sh',
+                delete=False
+            )
+            
+            if system == 'windows':
+                # Windows batch script that monitors progress file
+                script_content = f'''@echo off
+title {self.title}
+cls
+:loop
+cls
+type "{progress_file_path}"
+timeout /t 1 /nobreak >nul
+if exist "{progress_file_path}" goto loop
+echo.
+echo Compilation finished. Press any key to close...
+pause >nul
+'''
+                self.temp_script.write(script_content)
+                self.temp_script.close()
+                
+                # Start new cmd window
+                self.terminal_process = subprocess.Popen([
+                    'cmd', '/c', 'start', 'cmd', '/c', self.temp_script.name
+                ], shell=True)
+                
+            elif system == 'darwin':  # macOS
+                # macOS shell script that monitors progress file
+                script_content = f'''#!/bin/bash
+while [ -f "{progress_file_path}" ]; do
+    clear
+    cat "{progress_file_path}"
+    sleep 1
+done
+echo ""
+echo "Compilation finished. Press any key to close..."
+read -n 1
+'''
+                self.temp_script.write(script_content)
+                self.temp_script.close()
+                os.chmod(self.temp_script.name, 0o755)
+                
+                # Start new Terminal window
+                self.terminal_process = subprocess.Popen([
+                    'osascript', '-e', 
+                    f'tell app "Terminal" to do script "bash {self.temp_script.name}"'
+                ])
+                
+            else:  # Linux
+                # Linux shell script that monitors progress file
+                script_content = f'''#!/bin/bash
+while [ -f "{progress_file_path}" ]; do
+    clear
+    cat "{progress_file_path}"
+    sleep 1
+done
+echo ""
+echo "Compilation finished. Press any key to close..."
+read -n 1
+'''
+                self.temp_script.write(script_content)
+                self.temp_script.close()
+                os.chmod(self.temp_script.name, 0o755)
+                
+                # Try different terminal emulators
+                terminals = ['gnome-terminal', 'konsole', 'xterm']
+                for term in terminals:
+                    if shutil.which(term):
+                        if term == 'gnome-terminal':
+                            self.terminal_process = subprocess.Popen([
+                                term, '--', 'bash', self.temp_script.name
+                            ])
+                        else:
+                            self.terminal_process = subprocess.Popen([
+                                term, '-e', f'bash {self.temp_script.name}'
+                            ])
+                        break
+                
+            self.is_active = True
+            log.info(f"Started progress terminal: {self.title}")
+            return True
+            
+        except Exception as e:
+            log.warning(f"Failed to start progress terminal: {e}")
+            return False
+    
+    def update_progress(self, stage: str, progress: float, message: str, eta: Optional[float] = None):
+        """Update the progress display by writing to the progress file."""
+        if self.is_active and self.progress_file:
+            try:
+                elapsed = time.time() - getattr(self, '_start_time', time.time())
+                eta_msg = f" (ETA: {eta:.1f}s)" if eta else ""
+                
+                # Create progress bar using ASCII characters
+                bar_length = 40
+                filled_length = int(bar_length * progress / 100)
+                bar = '=' * filled_length + '-' * (bar_length - filled_length)
+                
+                # Write updated content to progress file
+                with open(self.progress_file.name, 'w') as f:
+                    f.write(f"{self.title}\n")
+                    f.write("=" * 50 + "\n")
+                    f.write(f"Stage: {stage.title()}\n")
+                    f.write(f"Progress: [{bar}] {progress:.1f}%\n")
+                    f.write(f"Status: {message}\n")
+                    f.write(f"Elapsed: {elapsed:.1f}s{eta_msg}\n")
+                    f.write("\n")
+                    if progress >= 100:
+                        f.write("COMPLETED\n")
+                    f.flush()
+                    
+            except Exception as e:
+                log.warning(f"Failed to update progress display: {e}")
+    
+    def close(self):
+        """Close the progress terminal."""
+        # Delete progress file to signal terminal to close
+        if self.progress_file:
+            try:
+                os.unlink(self.progress_file.name)
+            except:
+                pass
+            self.progress_file = None
+        
+        # Wait a moment for terminal to detect file deletion
+        time.sleep(1)
+        
+        if self.terminal_process:
+            try:
+                self.terminal_process.terminate()
+            except:
+                pass
+        
+        if self.temp_script and os.path.exists(self.temp_script.name):
+            try:
+                os.unlink(self.temp_script.name)
+            except:
+                pass
+        
+        self.is_active = False
+        log.info("Closed progress terminal")
+
+# -----------------------------
+# Directory Management
+# -----------------------------
+def clear_data_directory(keep_latest_pdf: bool = True, keep_latest_docx: bool = True) -> Tuple[bool, str]:
+    """Clear data directory while optionally keeping latest PDF and DOCX files.
+    
+    Args:
+        keep_latest_pdf: If True, keeps the most recently modified PDF file
+        keep_latest_docx: If True, keeps the most recently modified DOCX file
+        
+    Returns:
+        Tuple of (success, message)
+    """
+    try:
+        if not DATA_DIR.exists():
+            return True, "Data directory does not exist"
+        
+        # Get all files in data directory
+        all_files = list(DATA_DIR.glob("*"))
+        files_to_delete = []
+        
+        # Find latest PDF and DOCX if we need to keep them
+        latest_pdf = None
+        latest_docx = None
+        
+        if keep_latest_pdf:
+            pdf_files = [f for f in all_files if f.suffix.lower() == '.pdf' and f.is_file()]
+            if pdf_files:
+                latest_pdf = max(pdf_files, key=lambda f: f.stat().st_mtime)
+        
+        if keep_latest_docx:
+            docx_files = [f for f in all_files if f.suffix.lower() == '.docx' and f.is_file()]
+            if docx_files:
+                latest_docx = max(docx_files, key=lambda f: f.stat().st_mtime)
+        
+        # Determine which files to delete
+        for file_path in all_files:
+            if not file_path.is_file():
+                continue  # Skip directories
+            
+            # Keep the latest PDF and DOCX files
+            if file_path == latest_pdf or file_path == latest_docx:
+                continue
+                
+            files_to_delete.append(file_path)
+        
+        # Delete the files
+        deleted_count = 0
+        for file_path in files_to_delete:
+            try:
+                file_path.unlink()
+                deleted_count += 1
+                log.info(f"Deleted: {file_path.name}")
+            except Exception as e:
+                log.warning(f"Failed to delete {file_path.name}: {e}")
+        
+        # Prepare summary message
+        kept_files = []
+        if latest_pdf and latest_pdf.exists():
+            kept_files.append(f"PDF: {latest_pdf.name}")
+        if latest_docx and latest_docx.exists():
+            kept_files.append(f"DOCX: {latest_docx.name}")
+        
+        kept_msg = f"Kept files: {', '.join(kept_files)}" if kept_files else "No files kept"
+        message = f"Cleared data directory. Deleted {deleted_count} files. {kept_msg}"
+        
+        return True, message
+        
+    except Exception as e:
+        error_msg = f"Error clearing data directory: {str(e)}"
+        log.error(error_msg)
+        return False, error_msg
+
 # -----------------------------
 # PDF compilation
 # -----------------------------
@@ -946,14 +1217,26 @@ def submit_tailored_resume(filename_stem: str, latex_body: str) -> CompilationRe
     # Save LaTeX and compile with warmup support
     tex_path = _save_text(f"{stem}.tex", latex_body.strip())
     
-    # Create progress callback for detailed compilation tracking
-    progress_callback = ProgressCallback()
-    progress_callback.log_stage("initialization", f"Starting resume compilation for {stem}")
+    # Create progress callback for detailed compilation tracking with terminal
+    progress_callback = ProgressCallback(terminal_title=f"LaTeX Compilation: {stem}")
     
-    success, pdf_path, build_log = _compile_pdf_with_progress(tex_path, progress_callback)
+    try:
+        progress_callback.log_stage("initialization", f"Starting resume compilation for {stem}")
+        
+        success, pdf_path, build_log = _compile_pdf_with_progress(tex_path, progress_callback)
+        
+        if success:
+            progress_callback.complete_stage("finalization", "Resume compilation completed successfully")
+            # Keep terminal open for 3 seconds to show success
+            time.sleep(3)
+        else:
+            progress_callback.update("finalization", 100.0, "Compilation failed - check logs", 0.0)
+            # Keep terminal open longer for error review
+            time.sleep(5)
     
-    if success:
-        progress_callback.complete_stage("finalization", "Resume compilation completed successfully")
+    finally:
+        # Always close the progress terminal
+        progress_callback.close_terminal()
 
     # Create download prompt if successful
     download_prompt = None
@@ -1189,6 +1472,23 @@ def get_conversion_status() -> dict:
         "supported_formats": ["docx", "pdf", "html", "txt"] if CONVERSION_AVAILABLE else [],
         "recommended_format": "docx" if tools["pandoc"] else "pdf",
         "recommendation": "Use docx format for easy uploading to job portals" if tools["pandoc"] else "Install pandoc for Word conversion"
+    }
+
+@mcp.tool()
+def clear_data_files(keep_latest_pdf: bool = True, keep_latest_docx: bool = True) -> dict[str, str]:
+    """Clear old files from data directory, optionally keeping latest PDF and DOCX files.
+    
+    Args:
+        keep_latest_pdf: If True, keeps the most recently modified PDF file
+        keep_latest_docx: If True, keeps the most recently modified DOCX file
+    
+    Returns:
+        Dict with status and message about the cleanup operation
+    """
+    success, message = clear_data_directory(keep_latest_pdf, keep_latest_docx)
+    return {
+        "status": "success" if success else "error",
+        "message": message
     }
 
 @mcp.tool()
