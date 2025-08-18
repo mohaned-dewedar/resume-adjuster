@@ -275,6 +275,46 @@ def _slugify(s: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "_", s)
     return s.strip("_")
 # -----------------------------
+# System Notifications
+# -----------------------------
+def send_system_notification(title: str, message: str, duration: int = 5000) -> bool:
+    """Send a system notification across platforms."""
+    try:
+        import platform
+        system = platform.system().lower()
+        
+        if system == 'windows':
+            try:
+                # Try win10toast first
+                from win10toast import ToastNotifier
+                toaster = ToastNotifier()
+                toaster.show_toast(title, message, duration=duration//1000, threaded=True)
+                return True
+            except ImportError:
+                # Fallback to Windows native
+                import subprocess
+                subprocess.run([
+                    'powershell', '-Command',
+                    f'[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null; $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); $template.GetElementsByTagName("text")[0].AppendChild($template.CreateTextNode("{title}")); $template.GetElementsByTagName("text")[1].AppendChild($template.CreateTextNode("{message}")); $toast = [Windows.UI.Notifications.ToastNotification]::new($template); [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Claude Resume MCP").Show($toast)'
+                ], capture_output=True, timeout=5)
+                return True
+                
+        elif system == 'darwin':  # macOS
+            import subprocess
+            script = f'''display notification "{message}" with title "{title}"'''
+            subprocess.run(['osascript', '-e', script], capture_output=True, timeout=5)
+            return True
+            
+        else:  # Linux
+            import subprocess
+            subprocess.run(['notify-send', title, message], capture_output=True, timeout=5)
+            return True
+            
+    except Exception as e:
+        log.warning(f"Failed to send notification: {e}")
+        return False
+
+# -----------------------------
 # Progress Terminal Management
 # -----------------------------
 class ProgressTerminal:
@@ -1217,26 +1257,29 @@ def submit_tailored_resume(filename_stem: str, latex_body: str) -> CompilationRe
     # Save LaTeX and compile with warmup support
     tex_path = _save_text(f"{stem}.tex", latex_body.strip())
     
-    # Create progress callback for detailed compilation tracking with terminal
-    progress_callback = ProgressCallback(terminal_title=f"LaTeX Compilation: {stem}")
+    # Send start notification
+    send_system_notification("LaTeX Compilation Started", f"Compiling resume: {stem}")
     
-    try:
-        progress_callback.log_stage("initialization", f"Starting resume compilation for {stem}")
-        
-        success, pdf_path, build_log = _compile_pdf_with_progress(tex_path, progress_callback)
-        
-        if success:
-            progress_callback.complete_stage("finalization", "Resume compilation completed successfully")
-            # Keep terminal open for 3 seconds to show success
-            time.sleep(3)
-        else:
-            progress_callback.update("finalization", 100.0, "Compilation failed - check logs", 0.0)
-            # Keep terminal open longer for error review
-            time.sleep(5)
+    # Create progress callback without terminal (notifications only)
+    progress_callback = ProgressCallback(use_terminal=False)
+    progress_callback.log_stage("initialization", f"Starting resume compilation for {stem}")
     
-    finally:
-        # Always close the progress terminal
-        progress_callback.close_terminal()
+    success, pdf_path, build_log = _compile_pdf_with_progress(tex_path, progress_callback)
+    
+    # Send completion notification
+    if success:
+        progress_callback.complete_stage("finalization", "Resume compilation completed successfully")
+        import os
+        send_system_notification(
+            "✓ Resume Ready!", 
+            f"PDF generated successfully: {os.path.basename(pdf_path) if pdf_path else stem}.pdf"
+        )
+    else:
+        progress_callback.update("finalization", 100.0, "Compilation failed - check logs", 0.0)
+        send_system_notification(
+            "✗ Compilation Failed", 
+            f"LaTeX compilation failed for {stem}. Check the error details."
+        )
 
     # Create download prompt if successful
     download_prompt = None
@@ -1472,6 +1515,75 @@ def get_conversion_status() -> dict:
         "supported_formats": ["docx", "pdf", "html", "txt"] if CONVERSION_AVAILABLE else [],
         "recommended_format": "docx" if tools["pandoc"] else "pdf",
         "recommendation": "Use docx format for easy uploading to job portals" if tools["pandoc"] else "Install pandoc for Word conversion"
+    }
+
+@mcp.tool()
+def send_progress_notification(stage: str, progress: float, message: str, eta_seconds: Optional[float] = None) -> dict[str, str]:
+    """Send a progress notification to the system notification area.
+    
+    Args:
+        stage: Current compilation stage (detection, warmup, compilation, etc.)
+        progress: Progress percentage (0-100)
+        message: Progress message to display
+        eta_seconds: Estimated time remaining in seconds
+    
+    Returns:
+        Dict with status and details about the notification
+    """
+    eta_msg = f" (ETA: {eta_seconds:.0f}s)" if eta_seconds else ""
+    title = f"LaTeX Compilation - {stage.title()}"
+    notification_text = f"{message}\nProgress: {progress:.0f}%{eta_msg}"
+    
+    success = send_system_notification(title, notification_text)
+    
+    return {
+        "status": "sent" if success else "failed",
+        "message": f"Progress notification: {stage} - {progress:.0f}%",
+        "details": notification_text if success else "System notification unavailable"
+    }
+
+@mcp.tool() 
+def send_task_complete_notification(task: str, details: str = "", success: bool = True) -> dict[str, str]:
+    """Send a task completion notification.
+    
+    Args:
+        task: Description of completed task
+        details: Additional details about the task result
+        success: Whether the task completed successfully
+    
+    Returns:
+        Dict with notification status
+    """
+    title = "✓ Task Complete" if success else "✗ Task Failed"
+    message = f"{task}\n{details}" if details else task
+    
+    notification_success = send_system_notification(title, message)
+    
+    return {
+        "status": "sent" if notification_success else "failed", 
+        "message": f"Task notification: {task}",
+        "success": success
+    }
+
+@mcp.tool()
+def send_error_notification(error: str, details: str = "") -> dict[str, str]:
+    """Send an error notification.
+    
+    Args:
+        error: Error description
+        details: Additional error details or diagnostic information
+    
+    Returns:
+        Dict with notification status
+    """
+    title = "⚠ Error Occurred"
+    message = f"{error}\n{details}" if details else error
+    
+    success = send_system_notification(title, message)
+    
+    return {
+        "status": "sent" if success else "failed",
+        "message": f"Error notification: {error}"
     }
 
 @mcp.tool()
