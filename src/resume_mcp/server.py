@@ -7,7 +7,7 @@ import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Callable
 from pydantic import BaseModel, Field
 import re
 import requests
@@ -15,6 +15,8 @@ import json
 import threading
 import time
 import tempfile
+import urllib.parse
+import os
 from mcp.server.fastmcp import FastMCP
 # -----------------------------
 # Logging
@@ -52,7 +54,7 @@ STATE = {
     # Cover letter state
     "user_info": None,  # User's personal info for cover letters
     "cover_letter_requested": None,  # Boolean - user wants cover letter
-    "cover_letter_latex": None,  # Generated cover letter
+    "cover_letter_markdown": None,  # Generated cover letter (markdown format)
 }
 
 def _now_ts() -> str:
@@ -125,6 +127,46 @@ class ConversionResult(BaseModel):
     format: str = Field(description="Output format (docx, pdf, etc.)")
     error_message: Optional[str] = Field(description="Error message if conversion failed")
 
+class CompilationProgress(BaseModel):
+    """Progress tracking for LaTeX compilation."""
+    stage: str = Field(description="Current compilation stage")
+    progress: float = Field(description="Progress percentage (0-100)")
+    message: str = Field(description="Progress message")
+    eta_seconds: Optional[float] = Field(description="Estimated time remaining in seconds")
+    
+class ProgressCallback:
+    """Progress tracking callback for LaTeX compilation."""
+    
+    def __init__(self, callback_fn: Optional[Callable[[CompilationProgress], None]] = None):
+        self.callback_fn = callback_fn or self._default_progress_log
+        self.start_time = time.time()
+        self.current_stage = "initializing"
+        
+    def _default_progress_log(self, progress: CompilationProgress):
+        """Default progress logging to stderr."""
+        elapsed = time.time() - self.start_time
+        eta_msg = f" (ETA: {progress.eta_seconds:.1f}s)" if progress.eta_seconds else ""
+        log.info(f"[{elapsed:.1f}s] {progress.stage}: {progress.progress:.1f}% - {progress.message}{eta_msg}")
+    
+    def update(self, stage: str, progress: float, message: str, eta_seconds: Optional[float] = None):
+        """Update compilation progress."""
+        self.current_stage = stage
+        progress_obj = CompilationProgress(
+            stage=stage,
+            progress=progress,
+            message=message,
+            eta_seconds=eta_seconds
+        )
+        self.callback_fn(progress_obj)
+    
+    def log_stage(self, stage: str, message: str = ""):
+        """Log a new stage at 0% progress."""
+        self.update(stage, 0.0, message or f"Starting {stage}")
+    
+    def complete_stage(self, stage: str, message: str = ""):
+        """Mark a stage as 100% complete."""
+        self.update(stage, 100.0, message or f"Completed {stage}")
+
 # -----------------------------
 # Prompt defaults
 # -----------------------------
@@ -137,13 +179,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "Target exactly one page whenever possible. "
     
     "For cover letters: Create personalized, professional letters that complement the resume by highlighting "
-    "specific achievements and demonstrating company knowledge. Use the cover letter template structure. "
-    "Cover letters are automatically generated in both PDF and Word (.docx) formats - the Word format "
+    "specific achievements and demonstrating company knowledge. Use the markdown cover letter template structure. "
+    "Cover letters are automatically generated in Word (.docx) format and optionally PDF - the Word format "
     "is recommended for uploading to job portals and ATS systems. "
     
-    "Workflow: (1) Check if user info is loaded for cover letters, (2) Ask user preference for cover letter using "
-    "elicit_cover_letter_preference() if not set, (3) Generate resume with submit_tailored_resume(), "
-    "(4) Generate cover letter with submit_cover_letter() if requested. Use export_document() to convert "
+    "Workflow: (1) Check if user info is loaded for cover letters, (2) Generate resume with submit_tailored_resume(), "
+    "(3) Generate cover letter with submit_cover_letter() if requested. Use export_document() to convert "
     "resumes to Word format if needed for uploading."
 )
 
@@ -167,7 +208,7 @@ Cover Letter Workflow:
 3. If cover letter preference not set, call elicit_cover_letter_preference() tool
 4. If cover letter requested, call submit_cover_letter() with:
    - filename_stem: 'cover_letter_<role>_<company>'
-   - cover_letter_body: 3-4 paragraphs of compelling, personalized content (LaTeX format)
+   - cover_letter_body: 3-4 paragraphs of compelling, personalized content (markdown format)
 
 Cover Letter Content Guidelines:
 - Paragraph 1: Hook + specific position interest + brief value proposition
@@ -242,16 +283,24 @@ def _detect_pdf_tool() -> Tuple[str, List[str]]:
     
     return "", []
 
-def _compile_pdf(tex_path: str) -> Tuple[bool, str, str]:
-    """Compile TEX -> PDF in-place."""
+def _compile_pdf(tex_path: str, progress_callback: Optional[ProgressCallback] = None) -> Tuple[bool, str, str]:
+    """Compile TEX -> PDF in-place with optional progress tracking."""
+    if progress_callback is None:
+        progress_callback = ProgressCallback()
+    
     tex_file = Path(tex_path)
     workdir = tex_file.parent
     pdf_path = workdir / (tex_file.stem + ".pdf")
 
+    progress_callback.log_stage("detection", "Detecting LaTeX tools")
+    
     tool, base_cmd = _detect_pdf_tool()
     if not tool:
+        progress_callback.update("detection", 100.0, "No LaTeX tool found", 0.0)
         return (False, str(pdf_path), "No LaTeX tool found. Install MiKTeX/TeX Live or Pandoc.")
 
+    progress_callback.update("detection", 100.0, f"Using {tool}")
+    
     if tool == "latexmk":
         cmd = base_cmd + [tex_file.name]
     elif tool == "pdflatex":
@@ -262,18 +311,37 @@ def _compile_pdf(tex_path: str) -> Tuple[bool, str, str]:
         return (False, str(pdf_path), "Unknown LaTeX tool")
 
     log.info("Compiling PDF with %s: %s (cwd=%s)", tool, " ".join(cmd), workdir)
+    
     try:
+        progress_callback.log_stage("compilation", f"Running {tool} (pass 1)")
+        
+        start_time = time.time()
         p1 = subprocess.run(cmd, cwd=str(workdir), capture_output=True, text=True)
+        first_pass_time = time.time() - start_time
+        
         build_log = (p1.stdout or "") + "\n" + (p1.stderr or "")
+        
         if tool == "pdflatex":
+            progress_callback.update("compilation", 50.0, "Running pdflatex (pass 2)", first_pass_time)
+            
             p2 = subprocess.run(cmd, cwd=str(workdir), capture_output=True, text=True)
             build_log += "\n(second pass)\n" + (p2.stdout or "") + "\n" + (p2.stderr or "")
             rc = p1.returncode or p2.returncode
         else:
             rc = p1.returncode
+        
+        progress_callback.update("compilation", 90.0, "Checking output file")
+        
         ok = (rc == 0) and pdf_path.exists()
+        
+        if ok:
+            progress_callback.complete_stage("compilation", "PDF generated successfully")
+        else:
+            progress_callback.update("compilation", 100.0, "Compilation failed", 0.0)
+            
         return (ok, str(pdf_path), build_log)
     except Exception as e:
+        progress_callback.update("compilation", 100.0, f"Exception: {e}", 0.0)
         return (False, str(pdf_path), f"Exception: {e}")
 
 # -----------------------------
@@ -320,68 +388,39 @@ Email: test@example.com $|$ Phone: (555) 123-4567
 \end{document}
 """
 
-def _create_cover_letter_template(user_info: UserInfo, company: str, position: str) -> str:
-    """Create a professional cover letter LaTeX template."""
-    contact_line = f"{user_info.email}"
+def _create_cover_letter_template_markdown(user_info: UserInfo, company: str, position: str) -> str:
+    """Create a professional cover letter Markdown template."""
+    contact_parts = [user_info.email]
     if user_info.phone:
-        contact_line += f" $|$ {user_info.phone}"
+        contact_parts.append(user_info.phone)
     if user_info.linkedin:
-        contact_line += f" $|$ {user_info.linkedin}"
+        contact_parts.append(user_info.linkedin)
     
+    contact_line = " | ".join(contact_parts)
     address_line = user_info.address or "[Your Address]"
+    today = datetime.now().strftime("%B %d, %Y")
     
-    return f"""\\documentclass[letterpaper,11pt]{{article}}
-\\usepackage[left=1in,top=1in,right=1in,bottom=1in]{{geometry}}
-\\usepackage[hidelinks]{{hyperref}}
-\\usepackage{{fancyhdr}}
-\\pagestyle{{fancy}}
-\\fancyhf{{}}
-\\renewcommand{{\\headrulewidth}}{{0pt}}
+    return f"""# {user_info.full_name}
 
-\\begin{{document}}
-
-% Header
-\\begin{{center}}
-\\textbf{{\\Large {user_info.full_name}}}\\\\
-\\vspace{{2pt}}
-{contact_line}\\\\
+{contact_line}  
 {address_line}
-\\end{{center}}
 
-\\vspace{{0.5in}}
+---
 
-% Date and recipient
-\\noindent
-\\today
+{today}
 
-\\vspace{{0.3in}}
-
-\\noindent
-Hiring Manager\\\\
+Hiring Manager  
 {company}
 
-\\vspace{{0.3in}}
-
-\\noindent
 Dear Hiring Manager,
 
-\\vspace{{0.2in}}
-
-% Cover letter body will be inserted here by AI
 {{COVER_LETTER_BODY}}
 
-\\vspace{{0.3in}}
-
-\\noindent
 Sincerely,
 
-\\vspace{{0.3in}}
-
-\\noindent
 {user_info.full_name}
-
-\\end{{document}}
 """
+
 
 def _warmup_latex_async():
     """Warm up LaTeX tools in a background thread."""
@@ -424,26 +463,73 @@ def _ensure_latex_warmed_up():
         warmup_thread = threading.Thread(target=_warmup_latex_async, daemon=True)
         warmup_thread.start()
 
-def _compile_pdf_with_progress(tex_path: str) -> Tuple[bool, str, str]:
+def _compile_pdf_with_progress(tex_path: str, progress_callback: Optional[ProgressCallback] = None) -> Tuple[bool, str, str]:
     """Compile PDF with progress feedback and warmup check."""
+    if progress_callback is None:
+        progress_callback = ProgressCallback()
+    
     # Ensure LaTeX is warmed up
     if not STATE["latex_warmed_up"]:
-        log.info("LaTeX not warmed up, this compilation may take longer...")
+        progress_callback.log_stage("warmup", "LaTeX not warmed up - initializing tools")
         _ensure_latex_warmed_up()
         
         # If warmup is in progress, wait a bit for it to complete
         if STATE["warmup_in_progress"]:
-            log.info("Waiting for warmup to complete...")
+            progress_callback.update("warmup", 25.0, "Waiting for warmup to complete...")
             wait_count = 0
             while STATE["warmup_in_progress"] and wait_count < 30:  # Wait max 30 seconds
                 time.sleep(1)
                 wait_count += 1
+                progress = min(25.0 + (wait_count / 30.0) * 50.0, 75.0)
+                progress_callback.update("warmup", progress, f"Warming up LaTeX tools... ({wait_count}s)")
+        
+        if STATE["latex_warmed_up"]:
+            progress_callback.complete_stage("warmup", "LaTeX tools ready")
+        else:
+            progress_callback.update("warmup", 100.0, "Warmup timeout - proceeding anyway")
+    else:
+        progress_callback.update("warmup", 100.0, "LaTeX tools already warmed up")
     
-    return _compile_pdf(tex_path)
+    return _compile_pdf(tex_path, progress_callback)
 
 # -----------------------------
 # Document Conversion Functions
 # -----------------------------
+def _convert_markdown_to_word(markdown_path: str, output_format: str = "docx") -> Tuple[bool, str, str]:
+    """Convert Markdown document to Word format using pandoc."""
+    if not CONVERSION_AVAILABLE:
+        return False, "", "Document conversion libraries not installed"
+    
+    # Check if pandoc is available
+    if not shutil.which("pandoc"):
+        return False, "", "Pandoc not installed. Install from: https://pandoc.org/installing.html"
+    
+    markdown_file = Path(markdown_path)
+    output_path = markdown_file.parent / f"{markdown_file.stem}.{output_format}"
+    
+    try:
+        log.info(f"Converting {markdown_path} to {output_format} using pandoc")
+        
+        # Use pypandoc to convert Markdown to Word with better formatting
+        output = pypandoc.convert_file(
+            str(markdown_path), 
+            output_format,
+            outputfile=str(output_path),
+            extra_args=[
+                '--standalone',
+                '--wrap=none'
+            ]
+        )
+        
+        if output_path.exists():
+            return True, str(output_path), "Conversion successful"
+        else:
+            return False, str(output_path), "Output file not created"
+            
+    except Exception as e:
+        log.error(f"Conversion failed: {e}")
+        return False, str(output_path), f"Conversion error: {str(e)}"
+
 def _convert_tex_to_word(tex_path: str, output_format: str = "docx") -> Tuple[bool, str, str]:
     """Convert LaTeX document to Word format using pandoc."""
     if not CONVERSION_AVAILABLE:
@@ -639,13 +725,13 @@ def get_cover_letter_template():
     position = "[Position Title]"
     user_info = UserInfo.model_validate(STATE["user_info"])
     
-    template = _create_cover_letter_template(user_info, company, position)
+    template = _create_cover_letter_template_markdown(user_info, company, position)
     return f"""Cover Letter Template Structure:
 
 {template}
 
 Instructions for AI:
-- Replace {{COVER_LETTER_BODY}} with 3-4 compelling paragraphs
+- Replace {{COVER_LETTER_BODY}} with 3-4 compelling paragraphs in markdown format
 - Paragraph 1: Hook + specific position interest
 - Paragraph 2: Relevant experience and achievements
 - Paragraph 3: Company knowledge + value proposition
@@ -653,9 +739,11 @@ Instructions for AI:
 
 Guidelines:
 - Keep to one page
+- Use markdown formatting (bold for emphasis, etc.)
 - Use specific examples from resume
 - Match tone to company culture
-- Include 2-3 key skills from job description"""
+- Include 2-3 key skills from job description
+- Output will be automatically converted to Word format"""
 
 @mcp.resource("coverletter://status")
 def get_cover_letter_status():
@@ -663,7 +751,7 @@ def get_cover_letter_status():
     status = {
         "user_info_loaded": STATE.get("user_info") is not None,
         "cover_letter_requested": STATE.get("cover_letter_requested"),
-        "cover_letter_generated": STATE.get("cover_letter_latex") is not None,
+        "cover_letter_generated": STATE.get("cover_letter_markdown") is not None,
         "requirements_met": STATE.get("user_info") is not None and STATE.get("job_description") is not None
     }
     
@@ -813,7 +901,7 @@ def get_workflow_status() -> WorkflowStatus:
         has_company_brief=STATE["company_brief"] is not None,
         has_user_info=STATE.get("user_info") is not None,
         cover_letter_requested=STATE.get("cover_letter_requested"),
-        has_cover_letter=STATE.get("cover_letter_latex") is not None,
+        has_cover_letter=STATE.get("cover_letter_markdown") is not None,
         ready_for_generation=(
             STATE["resume_latex"] is not None and 
             STATE["job_description"] is not None
@@ -857,7 +945,15 @@ def submit_tailored_resume(filename_stem: str, latex_body: str) -> CompilationRe
 
     # Save LaTeX and compile with warmup support
     tex_path = _save_text(f"{stem}.tex", latex_body.strip())
-    success, pdf_path, build_log = _compile_pdf_with_progress(tex_path)
+    
+    # Create progress callback for detailed compilation tracking
+    progress_callback = ProgressCallback()
+    progress_callback.log_stage("initialization", f"Starting resume compilation for {stem}")
+    
+    success, pdf_path, build_log = _compile_pdf_with_progress(tex_path, progress_callback)
+    
+    if success:
+        progress_callback.complete_stage("finalization", "Resume compilation completed successfully")
 
     # Create download prompt if successful
     download_prompt = None
@@ -865,7 +961,7 @@ def submit_tailored_resume(filename_stem: str, latex_body: str) -> CompilationRe
         import os
         pdf_name = os.path.basename(pdf_path)
         tex_name = os.path.basename(tex_path)
-        download_prompt = f"✅ Resume generated successfully!\n\n📄 Files ready for download:\n• PDF: {pdf_name}\n• LaTeX: {tex_name}\n\n📂 Location: {DATA_DIR}\n\n💡 The PDF is ready for job applications!"
+        download_prompt = f"Resume generated successfully!\n\nFiles ready for download:\n• PDF: {pdf_name}\n• LaTeX: {tex_name}\n\nLocation: {DATA_DIR}\n\nThe PDF is ready for job applications!"
 
     return CompilationResult(
         success=success,
@@ -879,7 +975,7 @@ def submit_tailored_resume(filename_stem: str, latex_body: str) -> CompilationRe
 def submit_cover_letter(filename_stem: str, cover_letter_body: str, auto_convert_to_word: bool = True) -> dict:
     """
     Generate cover letter from body content. The body should be 3-4 paragraphs 
-    of LaTeX-formatted text that will be inserted into the template.
+    of markdown-formatted text that will be inserted into the template.
     Automatically converts to Word format for easy uploading to job portals.
     """
     if not STATE.get("user_info"):
@@ -898,9 +994,9 @@ def submit_cover_letter(filename_stem: str, cover_letter_body: str, auto_convert
     company = STATE.get("company", "Company")
     position = "Position"  # Could be extracted from job description
     
-    # Create full LaTeX document
-    template = _create_cover_letter_template(user_info, company, position)
-    full_latex = template.replace("{COVER_LETTER_BODY}", cover_letter_body.strip())
+    # Create full markdown document
+    template = _create_cover_letter_template_markdown(user_info, company, position)
+    full_markdown = template.replace("{COVER_LETTER_BODY}", cover_letter_body.strip())
     
     # Generate filename
     stem = _slugify(filename_stem or f"cover_letter_{company}")
@@ -909,51 +1005,53 @@ def submit_cover_letter(filename_stem: str, cover_letter_body: str, auto_convert
     stem = stem[:60].rstrip("_") or "cover_letter"
 
     # Avoid overwriting existing files
-    candidate_tex = DATA_DIR / f"{stem}.tex"
-    if candidate_tex.exists():
+    candidate_md = DATA_DIR / f"{stem}.md"
+    if candidate_md.exists():
         stem = f"{stem}_{_now_ts()}"
 
-    # Save LaTeX
-    tex_path = _save_text(f"{stem}.tex", full_latex)
-    STATE["cover_letter_latex"] = full_latex
+    # Save markdown
+    md_path = _save_text(f"{stem}.md", full_markdown)
+    STATE["cover_letter_markdown"] = full_markdown
     
     result = {
-        "tex_path": tex_path,
+        "md_path": md_path,
         "formats_generated": []
     }
     
-    # Generate PDF
-    pdf_success, pdf_path, build_log = _compile_pdf_with_progress(tex_path)
-    if pdf_success:
-        result["formats_generated"].append({"format": "pdf", "path": pdf_path})
-    
-    # Auto-convert to Word if requested and available
+    # Auto-convert to Word if requested and available (primary format)
     if auto_convert_to_word and CONVERSION_AVAILABLE:
-        word_success, word_path, word_message = _convert_tex_to_word(tex_path, "docx")
+        word_success, word_path, word_message = _convert_markdown_to_word(md_path, "docx")
         if word_success:
             result["formats_generated"].append({"format": "docx", "path": word_path})
             result["recommended_upload"] = word_path
         else:
             result["word_conversion_error"] = word_message
     
+    # Optionally generate PDF via pandoc
+    if CONVERSION_AVAILABLE:
+        pdf_success, pdf_path, pdf_message = _convert_markdown_to_word(md_path, "pdf")
+        if pdf_success:
+            result["formats_generated"].append({"format": "pdf", "path": pdf_path})
+    
     result["success"] = len(result["formats_generated"]) > 0
     if not result["success"]:
-        result["error"] = build_log[-1000:] if build_log else "Generation failed"
+        error_msg = result.get("word_conversion_error", "Generation failed")
+        result["error"] = error_msg
     else:
         # Create download prompt
         import os
-        download_prompt = "✅ Cover letter generated successfully!\n\n📄 Files ready for download:\n"
+        download_prompt = "Cover letter generated successfully!\n\nFiles ready for download:\n"
         
         for format_info in result["formats_generated"]:
             file_name = os.path.basename(format_info["path"])
             format_type = format_info["format"].upper()
             download_prompt += f"• {format_type}: {file_name}\n"
         
-        download_prompt += f"\n📂 Location: {DATA_DIR}\n"
+        download_prompt += f"\nLocation: {DATA_DIR}\n"
         
         if "recommended_upload" in result:
             rec_file = os.path.basename(result["recommended_upload"])
-            download_prompt += f"\n💡 Recommended for job portals: {rec_file}"
+            download_prompt += f"\nRecommended for job portals: {rec_file}"
         
         result["download_prompt"] = download_prompt
         result["message"] = f"Cover letter generated in {len(result['formats_generated'])} format(s)"
@@ -1096,7 +1194,7 @@ def get_conversion_status() -> dict:
 @mcp.tool()
 def reset_workflow() -> dict[str, str]:
     """Clear all loaded data and start fresh."""
-    for key in ["resume_latex", "job_description", "company", "company_brief", "cover_letter_requested", "cover_letter_latex", "cover_letter_request"]:
+    for key in ["resume_latex", "job_description", "company", "company_brief", "cover_letter_requested", "cover_letter_markdown", "cover_letter_request"]:
         STATE[key] = None
     # Keep user_info as it's personal and reusable across jobs
     return {"status": "reset", "message": "All job-specific data cleared (user info preserved)"}
